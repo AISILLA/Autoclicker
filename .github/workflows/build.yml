@@ -1,0 +1,573 @@
+name: Build AutoClicker APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Generate Android Project Files
+        run: |
+          mkdir -p app/src/main/java/com/example/autoclicker
+          mkdir -p app/src/main/res/xml
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AutoClicker"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.5.0' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.example.autoclicker'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.example.autoclicker"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/res/xml/accessibility_config.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="false"
+              android:notificationTimeout="100" />
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Auto Clicker"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AutoClickService"
+                      android:exported="false"
+                      android:label="Auto Clicker Service"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/autoclicker/AutoClickService.kt
+          package com.example.autoclicker
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class AutoClickService : AccessibilityService() {
+
+              companion object {
+                  const val ACTION_SHOW_PANEL = "ACTION_SHOW_PANEL"
+                  const val ACTION_HIDE_PANEL = "ACTION_HIDE_PANEL"
+                  var instance: AutoClickService? = null
+                  var intervalMs: Long = 100L
+              }
+
+              private lateinit var windowManager: WindowManager
+              private var controlPanel: LinearLayout? = null
+              private var playPauseBtn: TextView? = null
+
+              private data class TargetPoint(
+                  val view: TextView,
+                  val params: WindowManager.LayoutParams
+              )
+
+              private val targets = mutableListOf<TargetPoint>()
+              private var isClicking = false
+              private var currentTargetIndex = 0
+              private val handler = Handler(Looper.getMainLooper())
+
+              private val clickRunnable = object : Runnable {
+                  override fun run() {
+                      if (!isClicking || targets.isEmpty()) return
+
+                      val target = targets[currentTargetIndex % targets.size]
+                      val location = IntArray(2)
+                      target.view.getLocationOnScreen(location)
+
+                      val centerX = location[0] + target.view.width / 2f
+                      val centerY = location[1] + target.view.height / 2f
+
+                      performTap(centerX, centerY)
+
+                      currentTargetIndex = (currentTargetIndex + 1) % targets.size
+                      handler.postDelayed(this, intervalMs.coerceAtLeast(25L))
+                  }
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  instance = this
+                  windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_SHOW_PANEL -> showControlPanel()
+                      ACTION_HIDE_PANEL -> hideAllOverlays()
+                  }
+                  return super.onStartCommand(intent, flags, startId)
+              }
+
+              private fun showControlPanel() {
+                  if (controlPanel != null) return
+
+                  val panel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(16, 20, 16, 20)
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#DD1E1E2E"))
+                          cornerRadius = 40f
+                          setStroke(3, Color.parseColor("#44FFFFFF"))
+                      }
+                  }
+
+                  val panelParams = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                              WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = 24
+                      y = 300
+                  }
+
+                  playPauseBtn = createPanelButton("▶", "#4CAF50") {
+                      toggleClicking()
+                  }
+
+                  val addBtn = createPanelButton("➕", "#2196F3") {
+                      if (!isClicking) addTarget()
+                  }
+
+                  val removeBtn = createPanelButton("➖", "#FF9800") {
+                      if (!isClicking && targets.isNotEmpty()) {
+                          val last = targets.removeAt(targets.lastIndex)
+                          windowManager.removeView(last.view)
+                      }
+                  }
+
+                  val closeBtn = createPanelButton("✖", "#F44336") {
+                      hideAllOverlays()
+                  }
+
+                  panel.addView(playPauseBtn)
+                  panel.addView(addBtn)
+                  panel.addView(removeBtn)
+                  panel.addView(closeBtn)
+
+                  makeDraggable(panel, panelParams)
+                  windowManager.addView(panel, panelParams)
+                  controlPanel = panel
+
+                  if (targets.isEmpty()) {
+                      addTarget()
+                  }
+              }
+
+              private fun createPanelButton(
+                  symbol: String,
+                  colorHex: String,
+                  onClick: () -> Unit
+              ): TextView {
+                  return TextView(this).apply {
+                      text = symbol
+                      textSize = 18f
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      val size = (44 * resources.displayMetrics.density).toInt()
+                      layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                          bottomMargin = 14
+                      }
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(Color.parseColor(colorHex))
+                      }
+                      setOnClickListener { onClick() }
+                  }
+              }
+
+              private fun addTarget() {
+                  val number = targets.size + 1
+                  val sizePx = (52 * resources.displayMetrics.density).toInt()
+
+                  val targetView = TextView(this).apply {
+                      text = number.toString()
+                      textSize = 16f
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      background = createTargetDrawable(active = false)
+                  }
+
+                  val params = WindowManager.LayoutParams(
+                      sizePx,
+                      sizePx,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                              WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = 400 + (number * 40)
+                      y = 500 + (number * 40)
+                  }
+
+                  makeDraggable(targetView, params)
+                  windowManager.addView(targetView, params)
+                  targets.add(TargetPoint(targetView, params))
+              }
+
+              private fun createTargetDrawable(active: Boolean): GradientDrawable {
+                  return GradientDrawable().apply {
+                      shape = GradientDrawable.OVAL
+                      if (active) {
+                          setColor(Color.parseColor("#44FF5252"))
+                          setStroke(5, Color.parseColor("#FFFF5252"))
+                      } else {
+                          setColor(Color.parseColor("#6600E5FF"))
+                          setStroke(6, Color.parseColor("#FF00E5FF"))
+                      }
+                  }
+              }
+
+              private fun toggleClicking() {
+                  isClicking = !isClicking
+                  if (isClicking) {
+                      playPauseBtn?.text = "⏸"
+                      playPauseBtn?.background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(Color.parseColor("#FFC107"))
+                      }
+                      for (t in targets) {
+                          t.params.flags = t.params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                          t.view.background = createTargetDrawable(active = true)
+                          windowManager.updateViewLayout(t.view, t.params)
+                      }
+                      currentTargetIndex = 0
+                      handler.post(clickRunnable)
+                  } else {
+                      stopClicking()
+                  }
+              }
+
+              private fun stopClicking() {
+                  isClicking = false
+                  handler.removeCallbacks(clickRunnable)
+                  playPauseBtn?.text = "▶"
+                  playPauseBtn?.background = GradientDrawable().apply {
+                      shape = GradientDrawable.OVAL
+                      setColor(Color.parseColor("#4CAF50"))
+                  }
+                  for (t in targets) {
+                      t.params.flags = t.params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                      t.view.background = createTargetDrawable(active = false)
+                      windowManager.updateViewLayout(t.view, t.params)
+                  }
+              }
+
+              private fun performTap(x: Float, y: Float) {
+                  val path = Path().apply {
+                      moveTo(x, y)
+                  }
+                  val stroke = GestureDescription.StrokeDescription(path, 0L, 20L)
+                  val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                  dispatchGesture(gesture, null, null)
+              }
+
+              private fun makeDraggable(view: View, params: WindowManager.LayoutParams) {
+                  var initialX = 0
+                  var initialY = 0
+                  var initialTouchX = 0f
+                  var initialTouchY = 0f
+
+                  view.setOnTouchListener { _, event ->
+                      when (event.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              initialX = params.x
+                              initialY = params.y
+                              initialTouchX = event.rawX
+                              initialTouchY = event.rawY
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              params.x = initialX + (event.rawX - initialTouchX).toInt()
+                              params.y = initialY + (event.rawY - initialTouchY).toInt()
+                              windowManager.updateViewLayout(view, params)
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+              }
+
+              private fun hideAllOverlays() {
+                  stopClicking()
+                  for (t in targets) {
+                      runCatching { windowManager.removeView(t.view) }
+                  }
+                  targets.clear()
+                  controlPanel?.let {
+                      runCatching { windowManager.removeView(it) }
+                  }
+                  controlPanel = null
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {
+                  stopClicking()
+              }
+
+              override fun onDestroy() {
+                  hideAllOverlays()
+                  instance = null
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/autoclicker/MainActivity.kt
+          package com.example.autoclicker
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var statusText: TextView
+              private lateinit var intervalInput: EditText
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 80, 48, 48)
+                      setBackgroundColor(Color.parseColor("#121218"))
+                      gravity = Gravity.CENTER_HORIZONTAL
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "Auto Clicker"
+                      textSize = 26f
+                      setTextColor(Color.WHITE)
+                      setPadding(0, 0, 0, 32)
+                  }
+
+                  statusText = TextView(this).apply {
+                      textSize = 16f
+                      setPadding(0, 0, 0, 48)
+                  }
+
+                  val btnSettings = createStyledButton("1. Включить службу в настройках", "#3F51B5") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+
+                  val intervalLabel = TextView(this).apply {
+                      text = "Интервал между кликами (мс, мин. 25):"
+                      textSize = 14f
+                      setTextColor(Color.LTGRAY)
+                      setPadding(0, 36, 0, 12)
+                  }
+
+                  intervalInput = EditText(this).apply {
+                      setText(AutoClickService.intervalMs.toString())
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      setTextColor(Color.WHITE)
+                      setHintTextColor(Color.GRAY)
+                      setPadding(32, 24, 32, 24)
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#222230"))
+                          cornerRadius = 20f
+                      }
+                  }
+
+                  val btnStart = createStyledButton("2. Запустить плавающую панель", "#00897B") {
+                      val ms = intervalInput.text.toString().toLongOrNull() ?: 100L
+                      AutoClickService.intervalMs = ms.coerceAtLeast(25L)
+
+                      if (AutoClickService.instance == null) {
+                          Toast.makeText(
+                              this,
+                              "Сначала включи Auto Clicker в Спец. возможностях!",
+                              Toast.LENGTH_LONG
+                          ).show()
+                      } else {
+                          val intent = Intent(this, AutoClickService::class.java).apply {
+                              action = AutoClickService.ACTION_SHOW_PANEL
+                          }
+                          startService(intent)
+                          moveTaskToBack(true)
+                      }
+                  }
+
+                  val btnStop = createStyledButton("Скрыть панель", "#E53935") {
+                      val intent = Intent(this, AutoClickService::class.java).apply {
+                          action = AutoClickService.ACTION_HIDE_PANEL
+                      }
+                      startService(intent)
+                  }
+
+                  root.addView(title)
+                  root.addView(statusText)
+                  root.addView(btnSettings)
+                  root.addView(intervalLabel)
+                  root.addView(intervalInput)
+                  root.addView(btnStart)
+                  root.addView(btnStop)
+
+                  setContentView(root)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (AutoClickService.instance != null) {
+                      statusText.text = "✅ Служба активна и готова к работе"
+                      statusText.setTextColor(Color.parseColor("#4CAF50"))
+                  } else {
+                      statusText.text = "⚠️ Служба отключена (нажми кнопку 1)"
+                      statusText.setTextColor(Color.parseColor("#FF9800"))
+                  }
+              }
+
+              private fun createStyledButton(textStr: String, colorHex: String, onClick: () -> Unit): Button {
+                  return Button(this).apply {
+                      text = textStr
+                      setTextColor(Color.WHITE)
+                      isAllCaps = false
+                      textSize = 16f
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          topMargin = 28
+                      }
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor(colorHex))
+                          cornerRadius = 24f
+                      }
+                      setOnClickListener { onClick() }
+                  }
+              }
+          }
+          EOF
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build Debug APK
+        run: gradle assembleDebug
+
+      - name: Upload Compiled APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoClicker-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
